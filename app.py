@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import supplement_api
+from supplement_service import DomainError as SupplementDomainError
+from supplement_service import SupplementService
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
@@ -454,6 +458,7 @@ class CatastropheClaimService:
 
 class ApiHandler(BaseHTTPRequestHandler):
     service: CatastropheClaimService
+    supplement_service: SupplementService
 
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -482,9 +487,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path in {"/", "/index.html"}:
                 body = (ROOT / "static" / "index.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/supplements":
+                body = (ROOT / "static" / "supplements.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -498,15 +512,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif supplement_api.is_supplement_path(path):
+                status, payload = supplement_api.route_get(
+                    self.supplement_service, path, parsed.query, self.headers.get,
+                )
+                self._send(status, payload)
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
             self._send(exc.status, {"error": str(exc)})
+        except SupplementDomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
 
     def do_POST(self) -> None:
+        status = 201
         try:
-            path, data, (actor, role) = urlparse(self.path).path, self._json(), self._headers()
-            if path == "/api/claims":
+            parsed, data, (actor, role) = urlparse(self.path), self._json(), self._headers()
+            path = parsed.path
+            if supplement_api.is_supplement_path(path):
+                status, result = supplement_api.route_post(
+                    self.supplement_service, path, data, actor, role,
+                )
+            elif path == "/api/claims":
                 result = self.service.create_claim(actor, role, **data)
             elif path == "/api/claims/triage":
                 result = self.service.triage_claim(actor, role, **data)
@@ -524,8 +551,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.finalize_claim(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
-            self._send(201, result)
+            self._send(status, result)
         except DomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
+        except SupplementDomainError as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
@@ -536,8 +565,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         return
 
 
-def serve(service: CatastropheClaimService, host: str, port: int) -> None:
+def serve(service: CatastropheClaimService, host: str, port: int,
+          supplement_service: SupplementService | None = None) -> None:
     ApiHandler.service = service
+    ApiHandler.supplement_service = supplement_service or SupplementService(service.db_path)
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print("Catastrophe claim service listening on http://%s:%s" % (host, port))
     server.serve_forever()
@@ -552,10 +583,11 @@ def main() -> None:
     parser.add_argument("--seed", action="store_true")
     args = parser.parse_args()
     service = CatastropheClaimService(args.db)
+    supplement_service = SupplementService(args.db)
     if args.init:
         print(json.dumps(service.seed_demo() if args.seed else {"initialized": True, "db": args.db}, ensure_ascii=False))
         return
-    serve(service, args.host, args.port)
+    serve(service, args.host, args.port, supplement_service)
 
 
 if __name__ == "__main__":

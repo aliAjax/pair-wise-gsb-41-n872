@@ -1,0 +1,113 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>补赔漏项复核调度</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1280px;margin:28px auto;padding:0 20px;color:#263746}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px}
+th,td{border:1px solid #d3dce3;padding:6px 8px;vertical-align:top}th{background:#f1f5f7}
+.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px;margin:12px 0}
+code{background:#eef2f4;padding:2px 5px}
+form{background:#f7fafb;border:1px solid #d3dce3;padding:12px 16px;margin:12px 0}
+input,select,textarea{font:inherit;padding:4px 6px;margin:2px 6px 2px 0}
+button{cursor:pointer;padding:4px 12px}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+.pending{background:#fdecc8;color:#8a5a00}.returned{background:#fbdada;color:#9c2b2b}
+.confirmed{background:#d8f0dd;color:#1d6b32}.rejected{background:#e2e2e2;color:#555}
+a{color:#1b5e8c}
+</style>
+<h1>补赔漏项复核调度 <a href="/" style="font-size:13px">返回主调度页</a></h1>
+<div class="card">结案后 30 天内查勘员可补登漏项；同一案件仅一项待主管确认；补赔累计不超过原估损，超出退回补件。原赔付记录不改写，另存带原因的补赔版本。</div>
+<form id="identity">
+  操作人 <input id="user" value="surveyor1" size="12">
+  角色 <select id="role"><option>surveyor</option><option>adjuster</option><option>supervisor</option><option>auditor</option></select>
+  <button type="submit">切换并刷新</button>
+  <span id="msg" style="color:#9c2b2b"></span>
+</form>
+
+<form id="submitForm">
+  <strong>补登漏项（查勘员）</strong><br>
+  案件ID <input id="claimId" size="6" placeholder="如 1">
+  漏项物品 <input id="item" size="26" placeholder="如 冷库压缩机一台">
+  估损金额 <input id="amount" size="10" placeholder="元">
+  漏登原因 <input id="reason" size="26" placeholder="如 清点时被废墟覆盖未发现">
+  <button type="submit">提交漏项</button>
+</form>
+
+<h2>待办</h2>
+<table id="todo"><thead><tr>
+<th>补赔编号</th><th>原案</th><th>区域/险种</th><th>漏项</th><th>原因</th>
+<th>原估损</th><th>原赔付</th><th>已累计补赔</th><th>本次估损</th><th>状态</th><th>提交</th><th>主管操作</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>全部补赔版本</h2>
+<table id="all"><thead><tr>
+<th>补赔编号</th><th>原案</th><th>漏项</th><th>原因</th><th>原估损</th><th>原赔付</th>
+<th>已累计补赔(提交时)</th><th>估损</th><th>确认补赔</th><th>状态</th><th>提交人/确认人</th><th>时间</th>
+</tr></thead><tbody></tbody></table>
+
+<script>
+const $=s=>document.querySelector(s);
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function money(n){return Number(n||0).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
+function headers(){return{'X-User':$('#user').value.trim(),'X-Role':$('#role').value,'Content-Type':'application/json'}}
+function tag(s){const labels={pending:'待确认',returned:'退回补件',confirmed:'已确认',rejected:'已拒认'};
+  return `<span class="tag ${s}">${labels[s]||s}</span>`}
+function claimCell(r){const c=r.claim||{};return `${esc(c.claim_no||r.claim_id)}<br><small>保单 ${esc(c.policy_no||'')}</small>`}
+function regionCell(r){const c=r.claim||{};return `${esc(c.region||'')} / ${esc(c.peril_type||'')}<br><small>案件 ${esc(c.status||'')}</small>`}
+
+function actionCell(r){
+  if(!r.pending) return '';
+  return `<button onclick="confirmSup(${r.id})">确认补赔</button>
+          <button onclick="rejectSup(${r.id})">拒认</button>`;
+}
+function todoRow(r){
+  return `<tr><td>${esc(r.supplement_no)}</td><td>${claimCell(r)}</td><td>${regionCell(r)}</td>
+  <td>${esc(r.item_description)}</td><td>${esc(r.reason)}</td>
+  <td>${money(r.original_estimate)}</td><td>${money(r.original_payout)}</td>
+  <td>${money(r.confirmed_before)}</td><td>${money(r.estimated_amount)}</td>
+  <td>${tag(r.status)}</td><td>${esc(r.submitter)}<br><small>${esc(r.created_at)}</small></td>
+  <td>${actionCell(r)}</tr>`;
+}
+function allRow(r){
+  return `<tr><td>${esc(r.supplement_no)}<br><small>#${r.seq}</small></td><td>${claimCell(r)}</td>
+  <td>${esc(r.item_description)}</td><td>${esc(r.reason)}</td>
+  <td>${money(r.original_estimate)}</td><td>${money(r.original_payout)}</td>
+  <td>${money(r.confirmed_before)}</td><td>${money(r.estimated_amount)}</td>
+  <td>${r.confirmed_amount==null?'-':money(r.confirmed_amount)}</td>
+  <td>${tag(r.status)}</td>
+  <td>${esc(r.submitter)}<br><small>${esc(r.reviewed_by||'')}</small></td>
+  <td><small>${esc(r.created_at)}${r.reviewed_at?'<br>'+esc(r.reviewed_at):''}</small></td></tr>`;
+}
+async function refresh(){
+  $('#msg').textContent='';
+  const [todo,all]=await Promise.all([
+    fetch('/api/supplements/todo',{headers:headers()}).then(r=>r.json()),
+    fetch('/api/supplements',{headers:headers()}).then(r=>r.json())
+ ]);
+  if(todo.error){$('#msg').textContent=todo.error;return}
+  $('#todo tbody').innerHTML=(todo.todo||[]).map(todoRow).join('')||'<tr><td colspan="12">暂无待办</td></tr>';
+  $('#all tbody').innerHTML=(all.supplements||[]).map(allRow).join('')||'<tr><td colspan="12">暂无补赔版本</td></tr>';
+}
+$('#identity').onsubmit=e=>{e.preventDefault();refresh()};
+$('#submitForm').onsubmit=async e=>{
+  e.preventDefault();
+  const body={claim_id:Number($('#claimId').value),item_description:$('#item').value,
+    estimated_amount:Number($('#amount').value),reason:$('#reason').value};
+  const r=await fetch('/api/supplements',{method:'POST',headers:headers(),body:JSON.stringify(body)});
+  const d=await r.json();
+  $('#msg').textContent=d.error||d.message||'已提交';
+  if(!d.error){$('#item').value=$('#amount').value=$('#reason').value=''}
+  refresh();
+};
+async function confirmSup(id){
+  const v=prompt('确认补赔金额（留空按漏项估损全额确认，累计不得超过原估损）：','');
+  if(v===null)return;
+  const body={};if(v.trim())body.confirmed_amount=Number(v);
+  const r=await fetch(`/api/supplements/${id}/confirm`,{method:'POST',headers:headers(),body:JSON.stringify(body)});
+  const d=await r.json();$('#msg').textContent=d.error||('已确认 '+d.payment_reference);refresh();
+}
+async function rejectSup(id){
+  const v=prompt('拒认理由：','');if(v===null||!v.trim())return;
+  const r=await fetch(`/api/supplements/${id}/reject`,{method:'POST',headers:headers(),body:JSON.stringify({review_note:v})});
+  const d=await r.json();$('#msg').textContent=d.error||'已拒认';refresh();
+}
+refresh();
+</script></html>
