@@ -1,6 +1,26 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>巨灾理赔调度</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}</style>
-<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>优先队列</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th></tr></thead><tbody></tbody></table>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px}code{background:#eef2f4;padding:2px 5px}.tag{padding:1px 8px;border-radius:10px;font-size:13px}.pending{background:#fff1d6;color:#8a5a00}.confirmed{background:#e2f4e5;color:#1d6b2a}.returned{background:#fde3e3;color:#a12622}</style>
+<h1>巨灾保险理赔调度</h1><div class="card">状态页按调用角色过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。结案后漏项复核：查勘员在结案 30 天内提交漏项、估损和原因，同一案件仅一项待主管确认；累计补赔不超过原估损，超出退回补件；原赔付记录不改写，另存带原因的补赔版本。</div>
+<h2>优先队列（原案）</h2><table id="claims"><thead><tr><th>报案号</th><th>区域</th><th>状态</th><th>优先级</th><th>欺诈分</th><th>负责人</th><th>原估损</th><th>累计补赔</th></tr></thead><tbody></tbody></table>
+<h2>补赔待办</h2><table id="todos"><thead><tr><th>待办</th><th>报案号</th><th>漏项</th><th>申报金额</th><th>提交人</th><th>提交时间</th></tr></thead><tbody></tbody></table>
+<h2>漏项申报</h2><table id="supplements"><thead><tr><th>报案号</th><th>漏项</th><th>申报金额</th><th>状态</th><th>漏登原因</th><th>审核说明</th><th>提交人</th></tr></thead><tbody></tbody></table>
+<h2>补赔版本（原赔付记录不改写）</h2><table id="versions"><thead><tr><th>报案号</th><th>版本</th><th>补赔金额</th><th>原因</th><th>确认人</th><th>时间</th></tr></thead><tbody></tbody></table>
 <h2>最近时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#claims tbody').innerHTML=d.claims.map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const STATUS={pending:'待主管确认',confirmed:'已确认',returned:'退回补件'};
+const fmt=n=>Number(n||0).toLocaleString('zh-CN',{maximumFractionDigits:2});
+const empty=(cols,text)=>`<tr><td colspan=${cols} style="color:#8a97a3">${text}</td></tr>`;
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const no=id=>{const c=(d.claims||[]).find(c=>c.id===id);return c?c.claim_no:id};
+  const paid={};(d.supplement_payments||[]).forEach(p=>{paid[p.claim_id]=(paid[p.claim_id]||0)+p.amount});
+  document.querySelector('#claims tbody').innerHTML=(d.claims||[]).map(r=>`<tr><td>${r.claim_no}</td><td>${r.region}</td><td>${r.status}</td><td>${r.priority_score.toFixed(1)}</td><td>${r.fraud_score}</td><td>${r.assignee||''}</td><td>${fmt(r.estimated_loss)}</td><td>${fmt(paid[r.id])}</td></tr>`).join('');
+  const t=d.supplement_todos||{pending:[],returned:[]};
+  const rows=[...t.pending.map(x=>({k:'待主管确认',...x})),...t.returned.map(x=>({k:'待补件重报',...x}))];
+  document.querySelector('#todos tbody').innerHTML=rows.map(r=>`<tr><td>${r.k}</td><td>${no(r.claim_id)}</td><td>${r.items}</td><td>${fmt(r.amount)}</td><td>${r.surveyor}</td><td>${r.created_at}</td></tr>`).join('')||empty(6,'暂无待办');
+  document.querySelector('#supplements tbody').innerHTML=(d.supplements||[]).map(r=>`<tr><td>${no(r.claim_id)}</td><td>${r.items}</td><td>${fmt(r.amount)}</td><td><span class="tag ${r.status}">${STATUS[r.status]||r.status}</span></td><td>${r.reason}</td><td>${r.review_note||''}</td><td>${r.surveyor}</td></tr>`).join('')||empty(7,'暂无漏项申报');
+  document.querySelector('#versions tbody').innerHTML=(d.supplement_payments||[]).map(p=>`<tr><td>${no(p.claim_id)}</td><td>v${p.version}</td><td>${fmt(p.amount)}</td><td>${p.reason}</td><td>${p.approved_by}</td><td>${p.created_at}</td></tr>`).join('')||empty(6,'暂无补赔版本');
+  document.querySelector('#timeline').innerHTML=(d.timeline||[]).slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+}
+load();
+</script></html>

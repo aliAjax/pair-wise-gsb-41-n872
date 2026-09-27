@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from supplement_api import SupplementService, seed_demo as seed_supplement_demo
+from supplement_rules import SupplementError
+from supplement_store import SupplementStore
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
@@ -149,6 +153,9 @@ class CatastropheClaimService:
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(claims)")}
+            if "closed_at" not in columns:
+                conn.execute("ALTER TABLE claims ADD COLUMN closed_at TEXT")
 
     def _audit(self, conn: sqlite3.Connection, claim_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -402,9 +409,10 @@ class CatastropheClaimService:
             if decision == "reject" and not reason.strip():
                 raise DomainError("拒赔必须填写理由", 409)
             status = "approved" if decision == "approve" else "rejected"
+            now = utcnow()
             conn.execute(
-                "UPDATE claims SET status=?,final_payout=?,version=version+1,updated_at=? WHERE id=? AND version=?",
-                (status, payout if decision == "approve" else 0, utcnow(), claim_id, expected_version),
+                "UPDATE claims SET status=?,final_payout=?,closed_at=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+                (status, payout if decision == "approve" else 0, now, now, claim_id, expected_version),
             )
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
@@ -454,6 +462,7 @@ class CatastropheClaimService:
 
 class ApiHandler(BaseHTTPRequestHandler):
     service: CatastropheClaimService
+    supplements: SupplementService
 
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -494,13 +503,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/health":
                 self._send(200, {"status": "ok", "service": "catastrophe-claims"})
             elif path == "/api/state":
-                self._send(200, self.service.state(*self._headers()))
+                actor, role = self._headers()
+                state = self.service.state(actor, role)
+                if not state.get("access_limited"):
+                    state.update(self.supplements.state_extras(actor, role, [c["id"] for c in state["claims"]]))
+                self._send(200, state)
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/supplements":
+                actor, role = self._headers()
+                claim_id = parse_qs(urlparse(self.path).query).get("claim_id", [None])[0]
+                self._send(200, self.supplements.overview(actor, role, claim_id))
+            elif path == "/api/supplements/todos":
+                actor, role = self._headers()
+                self._send(200, {"todos": self.supplements.todos(actor, role)})
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
+        except SupplementError as exc:
             self._send(exc.status, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -522,10 +544,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/supplements":
+                result = self.supplements.submit(actor, role, data.get("claim_id"), data.get("items"),
+                                                 data.get("amount"), data.get("reason"))
+            elif path == "/api/supplements/confirm":
+                result = self.supplements.confirm(actor, role, data.get("request_id"))
+            elif path == "/api/supplements/return":
+                result = self.supplements.send_back(actor, role, data.get("request_id"), data.get("note"))
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
+            self._send(exc.status, {"error": str(exc)})
+        except SupplementError as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
@@ -536,8 +567,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return
 
 
-def serve(service: CatastropheClaimService, host: str, port: int) -> None:
+def serve(service: CatastropheClaimService, supplements: SupplementService, host: str, port: int) -> None:
     ApiHandler.service = service
+    ApiHandler.supplements = supplements
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print("Catastrophe claim service listening on http://%s:%s" % (host, port))
     server.serve_forever()
@@ -552,10 +584,14 @@ def main() -> None:
     parser.add_argument("--seed", action="store_true")
     args = parser.parse_args()
     service = CatastropheClaimService(args.db)
+    supplements = SupplementService(service, SupplementStore(args.db))
     if args.init:
-        print(json.dumps(service.seed_demo() if args.seed else {"initialized": True, "db": args.db}, ensure_ascii=False))
+        result = service.seed_demo() if args.seed else {"initialized": True, "db": args.db}
+        if args.seed and result.get("seeded"):
+            result["supplement_demo"] = seed_supplement_demo(service, supplements)
+        print(json.dumps(result, ensure_ascii=False))
         return
-    serve(service, args.host, args.port)
+    serve(service, supplements, args.host, args.port)
 
 
 if __name__ == "__main__":
